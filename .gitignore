@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Data (users' own uploaded/exported datasets shouldn't be committed)
+*.csv
+!sample_data.csv
+
+# Jupyter
+.ipynb_checkpoints/

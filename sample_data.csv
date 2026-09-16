@@ -1,0 +1,8 @@
+smiles,value,units,assay_type
+CCO,100,nM,IC50
+CCO,100,nM,IC50
+CC(=O)Oc1ccccc1C(=O)O,50,uM,Ki
+invalid_smiles_xxx,200,nM,IC50
+c1ccccc1,5000,nM,IC50
+CC(C)Cc1ccc(cc1)C(C)C(=O)O,30,uM,IC50
+CCN(CC)CC,80,nM,Ki
