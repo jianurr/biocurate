@@ -1,7 +1,14 @@
 # BioCurate
 
-A small web tool for curating bioactivity datasets (e.g. from ChEMBL, PubChem, BindingDB)
-before using them for QSAR / ML model training.
+🔗 **Try it live:** [biocuratejian.streamlit.app](https://biocuratejian.streamlit.app/)
+
+An open-source web tool for curating **any** bioactivity dataset — from ChEMBL,
+PubChem, BindingDB, an in-house screen, or your own compiled spreadsheet — before
+using it for QSAR / ML model training or downstream analysis.
+
+It is target-agnostic and assay-agnostic: it doesn't assume EGFR, kinases, or any
+specific project. You map your own column names to the pipeline's roles (SMILES,
+activity value, units, assay type), and it works the same way on any dataset.
 
 It flags — rather than silently drops or fixes — the most common quiet errors in
 bioactivity data:
@@ -13,6 +20,17 @@ bioactivity data:
 - Compounds tested under more than one assay type (IC50 mixed with Ki, etc.)
 - A simple per-row confidence score
 - A chemical diversity / scaffold report
+
+**Everything runs locally, in your browser, on your own machine — no data is
+uploaded anywhere.** This matters if you're working with unpublished or proprietary
+compound data.
+
+## Contributing
+
+This is meant to be a community tool. If you've hit a data-curation headache this
+doesn't cover yet, see [CONTRIBUTING.md](CONTRIBUTING.md) — issues and pull requests
+are welcome.
+
 
 ## 1. Setup (one-time)
 
