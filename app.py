@@ -9,6 +9,7 @@ Run locally with:
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
+from rdkit import Chem
 
 from pipeline import run_full_pipeline
 
@@ -21,7 +22,7 @@ st.markdown(
     """
     <style>
     .stApp {
-        background: linear-gradient(135deg, #0f2027 0%, #203a43 45%, #2c5364 100%);
+        background: linear-gradient(160deg, #f4f9fc 0%, #eaf3fb 50%, #eef6f2 100%);
     }
 
     section.main > div {
@@ -31,27 +32,26 @@ st.markdown(
     .bc-hero {
         padding: 2.2rem 2rem 1.6rem 2rem;
         border-radius: 18px;
-        background: linear-gradient(120deg, rgba(56, 189, 200, 0.18), rgba(80, 120, 220, 0.12));
-        border: 1px solid rgba(255,255,255,0.10);
+        background: linear-gradient(120deg, #ffffff, #eef7fb);
+        border: 1px solid rgba(30, 60, 90, 0.10);
+        box-shadow: 0 4px 18px rgba(20, 40, 70, 0.06);
         margin-bottom: 1.6rem;
     }
     .bc-hero h1 {
         font-size: 2.3rem;
         margin-bottom: 0.3rem;
-        background: linear-gradient(90deg, #5ee7df, #66a6ff);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
+        color: #14395c;
     }
     .bc-hero p {
-        color: rgba(230,240,245,0.85);
+        color: #33475b;
         font-size: 1.02rem;
         max-width: 800px;
     }
     .bc-badges span {
         display: inline-block;
-        background: rgba(255,255,255,0.08);
-        border: 1px solid rgba(255,255,255,0.15);
-        color: #d7ecff;
+        background: #eaf6ff;
+        border: 1px solid #bfe0f5;
+        color: #1c5f8a;
         padding: 3px 11px;
         border-radius: 999px;
         font-size: 0.78rem;
@@ -60,10 +60,11 @@ st.markdown(
     }
 
     div[data-testid="stMetric"] {
-        background: rgba(255,255,255,0.05);
-        border: 1px solid rgba(255,255,255,0.10);
+        background: #ffffff;
+        border: 1px solid rgba(30, 60, 90, 0.10);
         border-radius: 12px;
         padding: 12px 14px 6px 14px;
+        box-shadow: 0 2px 8px rgba(20, 40, 70, 0.04);
     }
 
     div[data-testid="stFileUploader"] {
@@ -71,11 +72,11 @@ st.markdown(
     }
 
     .bc-section-title {
-        color: #cdeaff;
+        color: #14395c;
         font-weight: 600;
         font-size: 1.15rem;
         margin: 1.4rem 0 0.4rem 0;
-        border-left: 4px solid #66a6ff;
+        border-left: 4px solid #3d8bc4;
         padding-left: 10px;
     }
 
@@ -163,6 +164,82 @@ def robust_read_csv(uploaded_file):
         return None, str(e)
 
 
+def guess_columns(df: pd.DataFrame):
+    """
+    Best-effort automatic detection of which column is SMILES, activity value,
+    units, and assay type — based on column names first, then content as a
+    fallback. Returns a dict of column names (or None if nothing confident
+    was found for that role).
+    """
+    cols = list(df.columns)
+    lower_map = {c: c.lower() for c in cols}
+
+    def find_by_keywords(keywords, exclude=None):
+        exclude = exclude or []
+        for c in cols:
+            name = lower_map[c]
+            if c in exclude:
+                continue
+            if any(k in name for k in keywords):
+                return c
+        return None
+
+    guessed = {}
+
+    # SMILES: name-based first, then content-based (try parsing a sample)
+    smiles_col = find_by_keywords(["smiles", "canonical_smiles", "structure"])
+    if smiles_col is None:
+        best_col, best_hits = None, 0
+        for c in cols:
+            sample = df[c].dropna().astype(str).head(20)
+            hits = sum(1 for s in sample if Chem.MolFromSmiles(s) is not None)
+            if hits > best_hits and hits >= max(3, len(sample) // 2):
+                best_col, best_hits = c, hits
+        smiles_col = best_col
+    guessed["smiles_col"] = smiles_col
+
+    # Activity value: name-based first, then "numeric column that isn't the smiles col"
+    value_col = find_by_keywords(
+        ["standard_value", "activity_value", "ic50", "ki", "ec50", "kd", "value", "activity", "affinity"],
+        exclude=[smiles_col] if smiles_col else [],
+    )
+    if value_col is None:
+        numeric_cols = [c for c in cols if c != smiles_col and pd.api.types.is_numeric_dtype(df[c])]
+        value_col = numeric_cols[0] if numeric_cols else None
+    guessed["value_col"] = value_col
+
+    # Units
+    unit_col = find_by_keywords(["unit", "units"], exclude=[smiles_col, value_col])
+    if unit_col is None:
+        known_units = {"nm", "um", "µm", "mm", "m"}
+        for c in cols:
+            if c in (smiles_col, value_col):
+                continue
+            sample = df[c].dropna().astype(str).str.lower().head(20)
+            if sample.isin(known_units).sum() >= max(1, len(sample) // 2):
+                unit_col = c
+                break
+    guessed["unit_col"] = unit_col
+
+    # Assay type
+    assay_col = find_by_keywords(
+        ["assay_type", "standard_type", "assay", "type"],
+        exclude=[smiles_col, value_col, unit_col],
+    )
+    if assay_col is None:
+        known_types = {"ic50", "ki", "ec50", "kd"}
+        for c in cols:
+            if c in (smiles_col, value_col, unit_col):
+                continue
+            sample = df[c].dropna().astype(str).str.lower().head(20)
+            if sample.isin(known_types).sum() >= max(1, len(sample) // 2):
+                assay_col = c
+                break
+    guessed["assay_type_col"] = assay_col
+
+    return guessed
+
+
 if uploaded_file is not None:
     raw_df, read_warning = robust_read_csv(uploaded_file)
 
@@ -181,16 +258,49 @@ if uploaded_file is not None:
     st.markdown('<div class="bc-section-title">📋 Preview of uploaded data</div>', unsafe_allow_html=True)
     st.dataframe(raw_df.head(10), use_container_width=True)
 
-    st.markdown('<div class="bc-section-title">🧭 Map your columns</div>', unsafe_allow_html=True)
+    st.markdown('<div class="bc-section-title">🧭 Column detection</div>', unsafe_allow_html=True)
+
+    guessed = guess_columns(raw_df)
     cols = raw_df.columns.tolist()
 
-    c1, c2 = st.columns(2)
-    with c1:
-        smiles_col = st.selectbox("SMILES column", cols, index=0)
-        value_col = st.selectbox("Activity value column", cols, index=min(1, len(cols) - 1))
-    with c2:
-        unit_col = st.selectbox("Units column", cols, index=min(2, len(cols) - 1))
-        assay_type_col = st.selectbox("Assay type column (IC50/Ki/etc.)", cols, index=min(3, len(cols) - 1))
+    missing_roles = [role for role, col in guessed.items() if col is None]
+
+    if not missing_roles:
+        st.success(
+            f"Detected automatically — SMILES: **{guessed['smiles_col']}**, "
+            f"Value: **{guessed['value_col']}**, "
+            f"Units: **{guessed['unit_col']}**, "
+            f"Assay type: **{guessed['assay_type_col']}**"
+        )
+    else:
+        st.warning(
+            "Couldn't confidently detect every column automatically "
+            f"({', '.join(missing_roles)}). Please check/fix the mapping below."
+        )
+
+    with st.expander("🔧 Adjust column mapping (only needed if detection looks wrong)"):
+        c1, c2 = st.columns(2)
+        with c1:
+            smiles_col = st.selectbox(
+                "SMILES column", cols,
+                index=cols.index(guessed["smiles_col"]) if guessed["smiles_col"] in cols else 0,
+            )
+            value_col = st.selectbox(
+                "Activity value column", cols,
+                index=cols.index(guessed["value_col"]) if guessed["value_col"] in cols else min(1, len(cols) - 1),
+            )
+        with c2:
+            unit_col = st.selectbox(
+                "Units column", cols,
+                index=cols.index(guessed["unit_col"]) if guessed["unit_col"] in cols else min(2, len(cols) - 1),
+            )
+            assay_type_col = st.selectbox(
+                "Assay type column (IC50/Ki/etc.)", cols,
+                index=cols.index(guessed["assay_type_col"]) if guessed["assay_type_col"] in cols else min(3, len(cols) - 1),
+            )
+    # Note: the selectboxes above always run (even while the expander is visually
+    # collapsed), so smiles_col/value_col/unit_col/assay_type_col are always set —
+    # either to the auto-detected default or the user's manual override.
 
     st.markdown('<div class="bc-section-title">⚙️ Options</div>', unsafe_allow_html=True)
     o1, o2 = st.columns(2)
@@ -272,17 +382,11 @@ if uploaded_file is not None:
         scaffold_counts = result_df["scaffold"].value_counts().head(15)
         if not scaffold_counts.empty:
             fig, ax = plt.subplots(figsize=(8, 4))
-            fig.patch.set_alpha(0.0)
-            ax.set_facecolor("none")
-            scaffold_counts.plot(kind="bar", ax=ax, color="#66a6ff")
-            ax.set_ylabel("Compound count", color="white")
-            ax.set_title("Top 15 most common scaffolds", color="white")
-            ax.tick_params(colors="white")
-            for spine in ax.spines.values():
-                spine.set_color("white")
-            plt.xticks(rotation=75, ha="right", fontsize=7, color="white")
-            plt.yticks(color="white")
-            st.pyplot(fig, transparent=True)
+            scaffold_counts.plot(kind="bar", ax=ax, color="#3d8bc4")
+            ax.set_ylabel("Compound count")
+            ax.set_title("Top 15 most common scaffolds")
+            plt.xticks(rotation=75, ha="right", fontsize=7)
+            st.pyplot(fig)
 
         st.divider()
 
