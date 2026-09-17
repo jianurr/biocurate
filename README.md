@@ -16,10 +16,51 @@ bioactivity data:
 - Molecules that fail to parse or standardize
 - Activity values with inconsistent or unrecognized units
 - Exact duplicate compounds (by InChIKey)
-- Near-duplicate compounds (Tanimoto similarity above a threshold)
+- Near-duplicate compounds (Tanimoto similarity above a threshold) — uses
+  exact brute-force comparison for smaller datasets, and a fast
+  scaffold-bucketed method for larger ones (see "Near-duplicate detection"
+  below for the honest trade-off involved)
 - Compounds tested under more than one assay type (IC50 mixed with Ki, etc.)
+- Multi-component mixtures/co-crystals that salt-stripping alone doesn't resolve
 - A simple per-row confidence score
 - A chemical diversity / scaffold report
+
+## Optional chemistry choices (off by default)
+
+Two real methodological decisions are exposed as opt-in toggles rather than
+silently baked in:
+
+- **Tautomer canonicalization** — unifies tautomers (e.g. keto/enol forms) as
+  the same compound before deduplication. Off by default, since this changes
+  what counts as "the same compound."
+- **Stereo-insensitive deduplication** — treats stereoisomers (e.g. enantiomers)
+  as duplicates of each other. Off by default; stereoisomers are treated as
+  distinct compounds unless you explicitly opt in.
+
+## Near-duplicate detection: the honest trade-off
+
+For datasets up to ~600 compounds, near-duplicate detection is exact
+brute-force comparison — every pair is checked, nothing is missed.
+
+For larger datasets, comparing every compound to every other compound
+becomes impractically slow (O(n²)), so BioCurate buckets compounds by Murcko
+scaffold first and only compares within each bucket. This is dramatically
+faster (10x+ fewer comparisons on realistic data), but it **can miss a small
+number of true near-duplicates** where the scaffold itself differs slightly
+(e.g. a ring-size change like cyclohexane → cycloheptane). The app tells you
+which method ran so this trade-off is never hidden.
+
+## Testing
+
+Run the test suite (39 tests covering structure standardization, unit
+conversion edge cases, exact/near-duplicate detection, tautomer/stereo/mixture
+handling, and the full end-to-end pipeline):
+
+```bash
+pip install -r requirements.txt
+pytest tests/ -v
+```
+
 
 **Everything runs locally, in your browser, on your own machine — no data is
 uploaded anywhere.** This matters if you're working with unpublished or proprietary

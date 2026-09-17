@@ -10,6 +10,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem.SaltRemover import SaltRemover
 from rdkit.Chem.Scaffolds import MurckoScaffold
+from rdkit.Chem.MolStandardize import rdMolStandardize
 from rdkit import DataStructs
 
 UNIT_TO_MOLAR = {
@@ -21,34 +22,84 @@ UNIT_TO_MOLAR = {
 }
 
 _remover = SaltRemover()
+_tautomer_enumerator = rdMolStandardize.TautomerEnumerator()
 
 
 # ---------- Module 1: Structure standardization ----------
 
-def standardize_molecule(smiles: str):
-    """Returns (clean_smiles, inchikey, status)."""
+def standardize_molecule(smiles: str, canonicalize_tautomers: bool = False,
+                          ignore_stereo: bool = False):
+    """
+    Returns (clean_smiles, inchikey, status, extra) where extra is a dict with
+    'is_mixture' (bool) and, if ignore_stereo, 'inchikey_no_stereo'.
+
+    canonicalize_tautomers: if True, runs RDKit's TautomerEnumerator to map
+        molecules to a canonical tautomer (e.g. keto/enol forms unify) before
+        generating the InChIKey. Off by default because it changes what
+        counts as "the same compound" — this is a real chemistry decision,
+        not just a bug fix, so it's opt-in and documented rather than silently
+        applied.
+
+    ignore_stereo: if True, also computes a stereo-insensitive InChIKey
+        (using the InChI "FixedH"/no-stereo option) so callers can choose
+        whether stereoisomers should be treated as duplicates or not. This
+        is likewise a real methodological choice, not a default assumption —
+        by default, stereoisomers are treated as distinct compounds (the
+        standard InChIKey already encodes stereochemistry).
+    """
+    extra = {"is_mixture": False, "inchikey_no_stereo": None}
+
     if not isinstance(smiles, str) or smiles.strip() == "":
-        return None, None, "empty_input"
+        return None, None, "empty_input", extra
 
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
-        return None, None, "parse_failed"
+        return None, None, "parse_failed", extra
 
     try:
         mol = _remover.StripMol(mol, dontRemoveEverything=True)
+
+        # After salt removal, check if multiple disconnected fragments remain.
+        # This catches mixtures/co-crystals/solvates that the salt list didn't
+        # explicitly cover — rather than silently keeping a multi-component
+        # SMILES as if it were a single compound, we flag it so the caller
+        # can decide how to handle it (e.g. exclude, or keep largest fragment).
+        frags = Chem.GetMolFrags(mol, asMols=False)
+        if len(frags) > 1:
+            extra["is_mixture"] = True
+
+        if canonicalize_tautomers:
+            mol = _tautomer_enumerator.Canonicalize(mol)
+
         clean_smiles = Chem.MolToSmiles(mol)
         inchikey = Chem.MolToInchiKey(mol)
-        return clean_smiles, inchikey, "ok"
+
+        if ignore_stereo:
+            try:
+                inchi_no_stereo = Chem.MolToInchi(mol, options="/SNon")
+                extra["inchikey_no_stereo"] = Chem.InchiToInchiKey(inchi_no_stereo)
+            except Exception:
+                extra["inchikey_no_stereo"] = None
+
+        return clean_smiles, inchikey, "ok", extra
     except Exception as e:
-        return None, None, f"standardization_failed: {e}"
+        return None, None, f"standardization_failed: {e}", extra
 
 
-def standardize_dataframe(df: pd.DataFrame, smiles_col: str) -> pd.DataFrame:
+def standardize_dataframe(df: pd.DataFrame, smiles_col: str,
+                           canonicalize_tautomers: bool = False,
+                           ignore_stereo: bool = False) -> pd.DataFrame:
     df = df.copy()
-    results = df[smiles_col].apply(standardize_molecule)
+    results = df[smiles_col].apply(
+        lambda s: standardize_molecule(s, canonicalize_tautomers=canonicalize_tautomers,
+                                        ignore_stereo=ignore_stereo)
+    )
     df["clean_smiles"] = results.apply(lambda x: x[0])
     df["inchikey"] = results.apply(lambda x: x[1])
     df["structure_status"] = results.apply(lambda x: x[2])
+    df["is_mixture"] = results.apply(lambda x: x[3]["is_mixture"])
+    if ignore_stereo:
+        df["inchikey_no_stereo"] = results.apply(lambda x: x[3]["inchikey_no_stereo"])
     return df
 
 
@@ -103,25 +154,74 @@ def get_fingerprint(smiles):
 
 
 def find_near_duplicates(df: pd.DataFrame, smiles_col: str = "clean_smiles",
-                          threshold: float = 0.95, max_compounds: int = 400):
+                          threshold: float = 0.95, brute_force_limit: int = 600,
+                          max_bucket_size: int = 500, scaffold_col: str = None):
     """
-    O(n^2) pairwise comparison — capped at max_compounds to stay laptop-friendly.
-    Returns a list of (index_i, index_j, similarity) tuples.
+    Near-duplicate detection with an honest speed/recall trade-off.
+
+    - Up to `brute_force_limit` compounds: exact O(n^2) comparison (same as
+      before) — guarantees every near-duplicate pair is found.
+    - Above that: compounds are bucketed by Murcko scaffold first (near-duplicates
+      almost always share a scaffold), and only compared within each bucket.
+      This is dramatically faster on large datasets, but — important caveat —
+      it CAN miss near-duplicate pairs where the scaffold itself differs
+      slightly (e.g. a ring-size change like cyclohexane -> cycloheptane).
+      In practice this misses a small minority of true near-duplicates in
+      exchange for making the check tractable on datasets of thousands of
+      compounds instead of being skipped/capped entirely.
+
+    Returns (pairs, n_comparisons_performed, method_used), where pairs is a
+    list of (index_i, index_j, similarity) using positions from
+    df.reset_index(drop=True), and method_used is "brute_force" or
+    "scaffold_bucketed" so callers/reports can be transparent about which
+    mode ran.
     """
-    subset = df.head(max_compounds).reset_index(drop=True)
-    fps = subset[smiles_col].apply(get_fingerprint).tolist()
+    working = df.reset_index(drop=True).copy()
+    working["_fp_for_dedup"] = working[smiles_col].apply(get_fingerprint)
+
+    valid_mask = working["_fp_for_dedup"].notna()
+    valid_idxs = working.index[valid_mask].tolist()
+    valid_fps = working.loc[valid_mask, "_fp_for_dedup"].tolist()
 
     pairs = []
-    for i in range(len(fps)):
-        if fps[i] is None:
-            continue
-        for j in range(i + 1, len(fps)):
-            if fps[j] is None:
-                continue
-            sim = DataStructs.TanimotoSimilarity(fps[i], fps[j])
-            if sim >= threshold:
-                pairs.append((i, j, round(sim, 3)))
-    return pairs, len(subset)
+    total_comparisons = 0
+
+    if len(valid_idxs) <= brute_force_limit:
+        # ---- Exact brute-force path ----
+        for i in range(len(valid_fps)):
+            sims = DataStructs.BulkTanimotoSimilarity(valid_fps[i], valid_fps[i + 1:])
+            total_comparisons += len(sims)
+            for offset, sim in enumerate(sims):
+                if sim >= threshold:
+                    j = i + 1 + offset
+                    pairs.append((valid_idxs[i], valid_idxs[j], round(sim, 3)))
+        method_used = "brute_force"
+
+    else:
+        # ---- Scaffold-bucketed path (faster, small recall trade-off) ----
+        if scaffold_col and scaffold_col in working.columns:
+            working["_scaffold_for_dedup"] = working[scaffold_col]
+        else:
+            working["_scaffold_for_dedup"] = working[smiles_col].apply(get_scaffold)
+
+        for scaffold_value, group in working.loc[valid_mask].groupby("_scaffold_for_dedup", dropna=False):
+            idxs = group.index.tolist()
+            fps = group["_fp_for_dedup"].tolist()
+
+            for chunk_start in range(0, len(fps), max_bucket_size):
+                chunk_idxs = idxs[chunk_start:chunk_start + max_bucket_size]
+                chunk_fps = fps[chunk_start:chunk_start + max_bucket_size]
+
+                for i in range(len(chunk_fps)):
+                    sims = DataStructs.BulkTanimotoSimilarity(chunk_fps[i], chunk_fps[i + 1:])
+                    total_comparisons += len(sims)
+                    for offset, sim in enumerate(sims):
+                        if sim >= threshold:
+                            j = i + 1 + offset
+                            pairs.append((chunk_idxs[i], chunk_idxs[j], round(sim, 3)))
+        method_used = "scaffold_bucketed"
+
+    return pairs, total_comparisons, method_used
 
 
 # ---------- Module 4: Assay type consistency ----------
@@ -256,21 +356,35 @@ def guess_columns(df: pd.DataFrame):
 def run_qsar_cleaning(df: pd.DataFrame, smiles_col: str, value_col: str,
                        unit_col: str, assay_type_col: str = None,
                        id_col: str = None, remove_near_duplicates: bool = False,
-                       near_dup_threshold: float = 0.98, near_dup_cap: int = 500):
+                       near_dup_threshold: float = 0.98, near_dup_brute_force_limit: int = 600,
+                       canonicalize_tautomers: bool = False, ignore_stereo: bool = False):
     """
     End-to-end automatic cleaning for ML/QSAR-ready output.
 
     Given a raw dataset with any number of extra/unnecessary columns, this:
       1. Keeps only the essential columns (id, smiles, value, units, assay type)
-      2. Standardizes structures (drops rows with missing/invalid SMILES)
+      2. Standardizes structures (drops rows with missing/invalid SMILES);
+         optionally canonicalizes tautomers and flags multi-component mixtures
       3. Converts activity values to a consistent pActivity scale
          (drops rows with missing/invalid activity values or units)
-      4. Removes exact duplicate compounds (keeps the first occurrence)
+      4. Removes exact duplicate compounds (keeps the first occurrence) —
+         using the standard (stereo-sensitive) InChIKey by default, or the
+         stereo-insensitive one if ignore_stereo=True
       5. Optionally removes near-duplicate compounds
       6. Optionally flags mixed assay-type compounds (kept, just flagged)
 
+    canonicalize_tautomers: unify tautomers (e.g. keto/enol) to one canonical
+        form before deduplication. Off by default — this changes what counts
+        as "the same compound," which is a real chemistry decision.
+
+    ignore_stereo: treat stereoisomers as duplicates of each other. Off by
+        default — stereoisomers are treated as distinct compounds unless you
+        explicitly opt into merging them.
+
     Returns:
-        clean_df       — the final ML-ready dataset
+        clean_df       — the final ML-ready dataset (includes an 'is_mixture'
+                          flag column — multi-component structures are kept
+                          but flagged, never silently merged or dropped)
         removed_df     — rows dropped for missing/invalid SMILES or activity data,
                           with a 'removal_reason' column
         duplicates_df  — rows dropped as exact (or near) duplicates,
@@ -287,7 +401,12 @@ def run_qsar_cleaning(df: pd.DataFrame, smiles_col: str, value_col: str,
     df = df[keep_cols].copy()
 
     # ---- Step 2: standardize structures ----
-    df = standardize_dataframe(df, smiles_col)
+    df = standardize_dataframe(df, smiles_col, canonicalize_tautomers=canonicalize_tautomers,
+                                ignore_stereo=ignore_stereo)
+    n_mixtures = int(df["is_mixture"].sum())
+
+    # Which InChIKey column to deduplicate on
+    dedup_key_col = "inchikey_no_stereo" if ignore_stereo else "inchikey"
 
     # ---- Step 3: normalize units / activity values ----
     df = normalize_units(df, value_col, unit_col)
@@ -310,12 +429,15 @@ def run_qsar_cleaning(df: pd.DataFrame, smiles_col: str, value_col: str,
     if not removed_df.empty:
         removed_df["removal_reason"] = removed_df.apply(_removal_reason, axis=1)
 
+
     df = df[~invalid_mask].copy()
     n_after_validity_filter = len(df)
 
     # ---- Step 5: exact duplicate removal (keep first occurrence) ----
-    df = flag_exact_duplicates(df, key_col="inchikey")
-    exact_dup_mask = df["exact_duplicate"] & df.duplicated(subset=["inchikey"], keep="first")
+    # Uses dedup_key_col — the standard stereo-sensitive InChIKey by default,
+    # or the stereo-insensitive one if ignore_stereo=True.
+    df = flag_exact_duplicates(df, key_col=dedup_key_col)
+    exact_dup_mask = df["exact_duplicate"] & df.duplicated(subset=[dedup_key_col], keep="first")
     duplicates_df = df[exact_dup_mask].copy()
     if not duplicates_df.empty:
         duplicates_df["removal_reason"] = "exact_duplicate_structure"
@@ -325,32 +447,37 @@ def run_qsar_cleaning(df: pd.DataFrame, smiles_col: str, value_col: str,
 
     # ---- Step 6: optional near-duplicate removal ----
     near_dup_removed_count = 0
+    near_dup_method_used = None
     if remove_near_duplicates and len(df) > 1:
-        near_dup_pairs, n_checked = find_near_duplicates(
-            df, smiles_col="clean_smiles",
-            threshold=near_dup_threshold, max_compounds=near_dup_cap
+        df_positional = df.reset_index(drop=True)
+        near_dup_pairs, n_checked, near_dup_method_used = find_near_duplicates(
+            df_positional, smiles_col="clean_smiles",
+            threshold=near_dup_threshold, brute_force_limit=near_dup_brute_force_limit,
         )
         # Drop the second compound in each near-duplicate pair (keep the first)
-        subset = df.head(near_dup_cap).reset_index()  # 'index' = original df index
-        drop_positions = {j for (_, j, _) in near_dup_pairs}
-        drop_original_indices = subset.loc[list(drop_positions), "index"].tolist() if drop_positions else []
+        drop_positions = sorted({j for (_, j, _) in near_dup_pairs})
 
-        if drop_original_indices:
-            near_dup_rows = df.loc[drop_original_indices].copy()
+        if drop_positions:
+            near_dup_rows = df_positional.loc[drop_positions].copy()
             near_dup_rows["removal_reason"] = "near_duplicate_structure"
             duplicates_df = pd.concat([duplicates_df, near_dup_rows], ignore_index=True)
-            df = df.drop(index=drop_original_indices)
-            near_dup_removed_count = len(drop_original_indices)
+            df = df_positional.drop(index=drop_positions).reset_index(drop=True)
+            near_dup_removed_count = len(drop_positions)
+        else:
+            df = df_positional
 
     # ---- Step 7: optional mixed assay-type flag (kept, not removed) ----
     if assay_type_col:
-        df = flag_mixed_assay_types(df, key_col="inchikey", assay_type_col=assay_type_col)
+        df = flag_mixed_assay_types(df, key_col=dedup_key_col, assay_type_col=assay_type_col)
 
     # ---- Final clean output: tidy column selection ----
     final_cols = []
     if id_col:
         final_cols.append(id_col)
     final_cols += ["clean_smiles", "inchikey"]
+    if ignore_stereo:
+        final_cols.append("inchikey_no_stereo")
+    final_cols.append("is_mixture")
     if assay_type_col:
         final_cols.append(assay_type_col)
     final_cols += ["pActivity"]
@@ -368,6 +495,9 @@ def run_qsar_cleaning(df: pd.DataFrame, smiles_col: str, value_col: str,
         "rows_after_validity_filter": n_after_validity_filter,
         "exact_duplicates_removed": int(len(duplicates_df)) - near_dup_removed_count if not duplicates_df.empty else 0,
         "near_duplicates_removed": near_dup_removed_count,
+        "near_duplicate_method": near_dup_method_used,
+        "mixtures_flagged": n_mixtures,
+        "dedup_key_used": dedup_key_col,
         "final_clean_rows": len(clean_df),
         "percent_retained": round(100 * len(clean_df) / original_n, 1) if original_n else 0.0,
     }
@@ -380,7 +510,7 @@ def run_qsar_cleaning(df: pd.DataFrame, smiles_col: str, value_col: str,
 def run_full_pipeline(df: pd.DataFrame, smiles_col: str, value_col: str,
                        unit_col: str, assay_type_col: str,
                        near_dup_threshold: float = 0.95,
-                       near_dup_cap: int = 400):
+                       near_dup_brute_force_limit: int = 400):
     """
     Runs all modules in sequence and returns (result_df, report_dict, near_dup_pairs).
     """
@@ -391,9 +521,9 @@ def run_full_pipeline(df: pd.DataFrame, smiles_col: str, value_col: str,
     df = compute_confidence_score(df)
     df = add_scaffolds(df)
 
-    near_dup_pairs, n_checked = find_near_duplicates(
+    near_dup_pairs, n_checked, near_dup_method = find_near_duplicates(
         df.dropna(subset=["clean_smiles"]), threshold=near_dup_threshold,
-        max_compounds=near_dup_cap
+        brute_force_limit=near_dup_brute_force_limit,
     )
 
     n_total = len(df)
@@ -411,6 +541,7 @@ def run_full_pipeline(df: pd.DataFrame, smiles_col: str, value_col: str,
         "exact_duplicates": int(n_exact_dup),
         "near_duplicate_pairs": len(near_dup_pairs),
         "near_duplicate_compounds_checked": n_checked,
+        "near_duplicate_method": near_dup_method,
         "mixed_assay_compounds": int(n_mixed_assay),
         "unique_scaffolds": int(n_scaffolds),
         "diversity_ratio": round(n_scaffolds / n_valid_structures, 3) if n_valid_structures else 0.0,

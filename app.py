@@ -1,6 +1,7 @@
 """
 app.py
-Streamlit web interface for the bioactivity data curation pipeline.
+Streamlit web interface for BioCurate — automatic bioactivity data cleaning
+for ML/QSAR-ready datasets.
 
 Run locally with:
     streamlit run app.py
@@ -8,15 +9,14 @@ Run locally with:
 
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
 from rdkit import Chem
 
-from pipeline import run_full_pipeline
+from pipeline import guess_columns, run_qsar_cleaning
 
 st.set_page_config(page_title="BioCurate", page_icon="🧪", layout="wide")
 
 # ---------------------------------------------------------------------------
-# Custom styling
+# Custom styling — light, high-contrast theme
 # ---------------------------------------------------------------------------
 st.markdown(
     """
@@ -24,10 +24,7 @@ st.markdown(
     .stApp {
         background: linear-gradient(160deg, #f4f9fc 0%, #eaf3fb 50%, #eef6f2 100%);
     }
-
-    section.main > div {
-        max-width: 1100px;
-    }
+    section.main > div { max-width: 1100px; }
 
     .bc-hero {
         padding: 2.2rem 2rem 1.6rem 2rem;
@@ -37,52 +34,23 @@ st.markdown(
         box-shadow: 0 4px 18px rgba(20, 40, 70, 0.06);
         margin-bottom: 1.6rem;
     }
-    .bc-hero h1 {
-        font-size: 2.3rem;
-        margin-bottom: 0.3rem;
-        color: #14395c;
-    }
-    .bc-hero p {
-        color: #33475b;
-        font-size: 1.02rem;
-        max-width: 800px;
-    }
+    .bc-hero h1 { font-size: 2.3rem; margin-bottom: 0.3rem; color: #14395c; }
+    .bc-hero p { color: #33475b; font-size: 1.02rem; max-width: 820px; }
     .bc-badges span {
-        display: inline-block;
-        background: #eaf6ff;
-        border: 1px solid #bfe0f5;
-        color: #1c5f8a;
-        padding: 3px 11px;
-        border-radius: 999px;
-        font-size: 0.78rem;
-        margin-right: 6px;
-        margin-top: 8px;
+        display: inline-block; background: #eaf6ff; border: 1px solid #bfe0f5;
+        color: #1c5f8a; padding: 3px 11px; border-radius: 999px;
+        font-size: 0.78rem; margin-right: 6px; margin-top: 8px;
     }
-
     div[data-testid="stMetric"] {
-        background: #ffffff;
-        border: 1px solid rgba(30, 60, 90, 0.10);
-        border-radius: 12px;
-        padding: 12px 14px 6px 14px;
+        background: #ffffff; border: 1px solid rgba(30, 60, 90, 0.10);
+        border-radius: 12px; padding: 12px 14px 6px 14px;
         box-shadow: 0 2px 8px rgba(20, 40, 70, 0.04);
     }
-
-    div[data-testid="stFileUploader"] {
-        border-radius: 14px;
-    }
-
     .bc-section-title {
-        color: #14395c;
-        font-weight: 600;
-        font-size: 1.15rem;
-        margin: 1.4rem 0 0.4rem 0;
-        border-left: 4px solid #3d8bc4;
-        padding-left: 10px;
+        color: #14395c; font-weight: 600; font-size: 1.15rem;
+        margin: 1.4rem 0 0.4rem 0; border-left: 4px solid #3d8bc4; padding-left: 10px;
     }
-
-    .stTabs [data-baseweb="tab"] {
-        border-radius: 8px 8px 0 0;
-    }
+    .stTabs [data-baseweb="tab"] { border-radius: 8px 8px 0 0; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -94,23 +62,27 @@ st.markdown(
 with st.sidebar:
     st.markdown("### 🧪 BioCurate")
     st.markdown(
-        "An open-source tool that flags — rather than silently drops or fixes — "
-        "the quiet errors in bioactivity datasets before ML/QSAR work."
+        "Upload any raw bioactivity export (ChEMBL, PubChem, BindingDB, or your own "
+        "screen) and get back a clean, ML/QSAR-ready dataset automatically."
     )
     st.markdown("---")
-    st.markdown("**What it checks:**")
+    st.markdown("**What happens automatically:**")
     st.markdown(
-        "- Structure parsing & standardization\n"
-        "- Unit / activity conversion\n"
-        "- Exact & near-duplicate compounds\n"
-        "- Mixed assay-type compounds\n"
-        "- Per-row confidence score\n"
-        "- Scaffold diversity"
+        "1. Detects the SMILES, activity value, units, and assay-type columns\n"
+        "2. Drops every other (unneeded) column\n"
+        "3. Standardizes chemical structures\n"
+        "4. Converts activity values to a consistent scale (pActivity)\n"
+        "5. Removes rows with missing/invalid structures or values\n"
+        "6. Removes exact duplicate compounds\n"
+        "7. Optionally removes near-duplicate compounds"
     )
     st.markdown("---")
-    st.markdown("**Everything runs locally** — your data never leaves this session.")
+    st.markdown("**Nothing is silently discarded** — removed and duplicate rows "
+                "are given back to you as separate downloadable files.")
     st.markdown("---")
-    st.markdown("[⭐ View source / contribute on GitHub](https://github.com/jianurr/biocurate)")
+    st.markdown("**Runs locally** — your data isn't stored anywhere.")
+    st.markdown("---")
+    st.markdown("[⭐ Source / contribute on GitHub](https://github.com/jianurr/biocurate)")
 
 # ---------------------------------------------------------------------------
 # Hero header
@@ -119,15 +91,16 @@ st.markdown(
     """
     <div class="bc-hero">
         <h1>🧪 BioCurate</h1>
-        <p>Upload a raw bioactivity dataset (ChEMBL, PubChem, BindingDB, or your own screen)
-        and get a cleaned, standardized dataset plus a diagnostic report — with every
-        structure, unit, duplicate, and assay-type issue flagged for you to inspect,
-        never silently dropped.</p>
+        <p>Upload a raw bioactivity dataset. BioCurate automatically detects the
+        columns that matter, strips out everything else, fixes and standardizes
+        the chemistry, removes duplicates, and hands you back a clean file that's
+        ready for QSAR/ML training — plus the rows it removed, kept separately
+        so nothing disappears without a trace.</p>
         <div class="bc-badges">
             <span>🧬 RDKit-powered</span>
             <span>🔓 Open source</span>
             <span>💻 Runs locally</span>
-            <span>📊 Any bioactivity dataset</span>
+            <span>⚡ Fully automatic</span>
         </div>
     </div>
     """,
@@ -138,10 +111,7 @@ uploaded_file = st.file_uploader("📂 Upload your CSV file", type=["csv"])
 
 
 def robust_read_csv(uploaded_file):
-    """
-    Try several common separators/encodings before giving up, and return
-    a clear error message instead of letting pandas crash the app.
-    """
+    """Try common separators/encodings; return (df, warning) or (None, error)."""
     separators = [",", "\t", ";", "|"]
     encodings = ["utf-8", "utf-8-sig", "latin1"]
 
@@ -150,12 +120,11 @@ def robust_read_csv(uploaded_file):
             try:
                 uploaded_file.seek(0)
                 df = pd.read_csv(uploaded_file, sep=sep, encoding=encoding, engine="python")
-                if df.shape[1] > 1:  # a real delimiter was found, not one giant column
+                if df.shape[1] > 1:
                     return df, None
             except Exception:
                 continue
 
-    # Last resort: let pandas skip broken rows instead of failing entirely
     try:
         uploaded_file.seek(0)
         df = pd.read_csv(uploaded_file, sep=None, engine="python", on_bad_lines="skip")
@@ -164,90 +133,13 @@ def robust_read_csv(uploaded_file):
         return None, str(e)
 
 
-def guess_columns(df: pd.DataFrame):
-    """
-    Best-effort automatic detection of which column is SMILES, activity value,
-    units, and assay type — based on column names first, then content as a
-    fallback. Returns a dict of column names (or None if nothing confident
-    was found for that role).
-    """
-    cols = list(df.columns)
-    lower_map = {c: c.lower() for c in cols}
-
-    def find_by_keywords(keywords, exclude=None):
-        exclude = exclude or []
-        for c in cols:
-            name = lower_map[c]
-            if c in exclude:
-                continue
-            if any(k in name for k in keywords):
-                return c
-        return None
-
-    guessed = {}
-
-    # SMILES: name-based first, then content-based (try parsing a sample)
-    smiles_col = find_by_keywords(["smiles", "canonical_smiles", "structure"])
-    if smiles_col is None:
-        best_col, best_hits = None, 0
-        for c in cols:
-            sample = df[c].dropna().astype(str).head(20)
-            hits = sum(1 for s in sample if Chem.MolFromSmiles(s) is not None)
-            if hits > best_hits and hits >= max(3, len(sample) // 2):
-                best_col, best_hits = c, hits
-        smiles_col = best_col
-    guessed["smiles_col"] = smiles_col
-
-    # Activity value: name-based first, then "numeric column that isn't the smiles col"
-    value_col = find_by_keywords(
-        ["standard_value", "activity_value", "ic50", "ki", "ec50", "kd", "value", "activity", "affinity"],
-        exclude=[smiles_col] if smiles_col else [],
-    )
-    if value_col is None:
-        numeric_cols = [c for c in cols if c != smiles_col and pd.api.types.is_numeric_dtype(df[c])]
-        value_col = numeric_cols[0] if numeric_cols else None
-    guessed["value_col"] = value_col
-
-    # Units
-    unit_col = find_by_keywords(["unit", "units"], exclude=[smiles_col, value_col])
-    if unit_col is None:
-        known_units = {"nm", "um", "µm", "mm", "m"}
-        for c in cols:
-            if c in (smiles_col, value_col):
-                continue
-            sample = df[c].dropna().astype(str).str.lower().head(20)
-            if sample.isin(known_units).sum() >= max(1, len(sample) // 2):
-                unit_col = c
-                break
-    guessed["unit_col"] = unit_col
-
-    # Assay type
-    assay_col = find_by_keywords(
-        ["assay_type", "standard_type", "assay", "type"],
-        exclude=[smiles_col, value_col, unit_col],
-    )
-    if assay_col is None:
-        known_types = {"ic50", "ki", "ec50", "kd"}
-        for c in cols:
-            if c in (smiles_col, value_col, unit_col):
-                continue
-            sample = df[c].dropna().astype(str).str.lower().head(20)
-            if sample.isin(known_types).sum() >= max(1, len(sample) // 2):
-                assay_col = c
-                break
-    guessed["assay_type_col"] = assay_col
-
-    return guessed
-
-
 if uploaded_file is not None:
     raw_df, read_warning = robust_read_csv(uploaded_file)
 
     if raw_df is None:
         st.error(
             "Could not read this file as a table. Please check that it is a plain "
-            "CSV/TSV file with a single header row and consistent columns, then "
-            "try again.\n\n"
+            "CSV/TSV file with a single header row and consistent columns.\n\n"
             f"Technical detail: {read_warning}"
         )
         st.stop()
@@ -256,25 +148,26 @@ if uploaded_file is not None:
         st.warning(read_warning)
 
     st.markdown('<div class="bc-section-title">📋 Preview of uploaded data</div>', unsafe_allow_html=True)
+    st.caption(f"{raw_df.shape[0]} rows × {raw_df.shape[1]} columns")
     st.dataframe(raw_df.head(10), use_container_width=True)
 
-    st.markdown('<div class="bc-section-title">🧭 Column detection</div>', unsafe_allow_html=True)
-
+    # ---- Automatic column detection ----
     guessed = guess_columns(raw_df)
     cols = raw_df.columns.tolist()
 
-    missing_roles = [role for role, col in guessed.items() if col is None]
+    missing_roles = [role for role, col in guessed.items() if col is None and role != "id_col"]
 
+    st.markdown('<div class="bc-section-title">🧭 Column detection</div>', unsafe_allow_html=True)
     if not missing_roles:
         st.success(
             f"Detected automatically — SMILES: **{guessed['smiles_col']}**, "
             f"Value: **{guessed['value_col']}**, "
             f"Units: **{guessed['unit_col']}**, "
-            f"Assay type: **{guessed['assay_type_col']}**"
+            f"Assay type: **{guessed['assay_type_col'] or 'not found (optional)'}**"
         )
     else:
         st.warning(
-            "Couldn't confidently detect every column automatically "
+            "Couldn't confidently detect every required column automatically "
             f"({', '.join(missing_roles)}). Please check/fix the mapping below."
         )
 
@@ -294,113 +187,133 @@ if uploaded_file is not None:
                 "Units column", cols,
                 index=cols.index(guessed["unit_col"]) if guessed["unit_col"] in cols else min(2, len(cols) - 1),
             )
+            assay_options = ["(none)"] + cols
+            default_assay = guessed["assay_type_col"] if guessed["assay_type_col"] in cols else "(none)"
             assay_type_col = st.selectbox(
-                "Assay type column (IC50/Ki/etc.)", cols,
-                index=cols.index(guessed["assay_type_col"]) if guessed["assay_type_col"] in cols else min(3, len(cols) - 1),
+                "Assay type column (optional)", assay_options,
+                index=assay_options.index(default_assay),
             )
-    # Note: the selectboxes above always run (even while the expander is visually
-    # collapsed), so smiles_col/value_col/unit_col/assay_type_col are always set —
-    # either to the auto-detected default or the user's manual override.
+            assay_type_col = None if assay_type_col == "(none)" else assay_type_col
+
+        id_options = ["(none)"] + cols
+        id_col = st.selectbox("Compound ID column (optional)", id_options, index=0)
+        id_col = None if id_col == "(none)" else id_col
 
     st.markdown('<div class="bc-section-title">⚙️ Options</div>', unsafe_allow_html=True)
     o1, o2 = st.columns(2)
     with o1:
-        near_dup_threshold = st.slider("Near-duplicate similarity threshold (Tanimoto)", 0.80, 1.00, 0.95, 0.01)
+        remove_near_dup = st.checkbox(
+            "Remove near-duplicate compounds (Tanimoto ≥ 0.98)",
+            value=False,
+            help="Off by default — near-duplicates can sometimes be legitimate close "
+                 "analogs, so this is opt-in.",
+        )
+        canonicalize_tautomers = st.checkbox(
+            "Unify tautomers (e.g. keto/enol forms) as the same compound",
+            value=False,
+            help="Off by default. When on, tautomers are canonicalized before "
+                 "deduplication — a real chemistry choice about what counts as "
+                 "'the same compound', not just a bug fix.",
+        )
     with o2:
-        near_dup_cap = st.number_input(
-            "Max compounds to check for near-duplicates (keeps this laptop-friendly)",
-            min_value=50, max_value=2000, value=400, step=50
+        ignore_stereo = st.checkbox(
+            "Treat stereoisomers as duplicates of each other",
+            value=False,
+            help="Off by default — stereoisomers (e.g. enantiomers) are treated as "
+                 "distinct compounds unless you explicitly opt into merging them.",
         )
 
     st.write("")
-    run_button = st.button("🚀 Run curation pipeline", type="primary", use_container_width=True)
+    run_button = st.button("🚀 Clean my data", type="primary", use_container_width=True)
 
     if run_button:
         try:
-            with st.spinner("Running pipeline..."):
-                result_df, report, near_dup_pairs = run_full_pipeline(
+            with st.spinner("Cleaning your data..."):
+                clean_df, removed_df, duplicates_df, report = run_qsar_cleaning(
                     raw_df, smiles_col, value_col, unit_col, assay_type_col,
-                    near_dup_threshold=near_dup_threshold,
-                    near_dup_cap=near_dup_cap,
+                    id_col=id_col, remove_near_duplicates=remove_near_dup,
+                    canonicalize_tautomers=canonicalize_tautomers,
+                    ignore_stereo=ignore_stereo,
                 )
         except Exception as e:
             st.error(
-                "Something went wrong while running the pipeline. This usually means "
-                "the columns you mapped don't contain the kind of data expected "
-                "(e.g. the 'SMILES column' should contain chemical structure strings, "
-                "and the 'value' column should be numeric).\n\n"
+                "Something went wrong while cleaning. This usually means the columns "
+                "mapped above don't contain the kind of data expected (e.g. the SMILES "
+                "column should contain chemical structure strings, the value column "
+                "should be numeric).\n\n"
                 f"Technical detail: {e}"
             )
             st.stop()
 
         st.success("✅ Done — see the results below.")
 
-        st.markdown('<div class="bc-section-title">📊 Summary report</div>', unsafe_allow_html=True)
-        rc1, rc2, rc3, rc4 = st.columns(4)
-        rc1.metric("Total rows", report["total_rows"])
-        rc1.metric("Structure parse failures", report["structure_parse_failures"])
-        rc2.metric("Unit conversion failures", report["unit_conversion_failures"])
-        rc2.metric("Exact duplicates", report["exact_duplicates"])
-        rc3.metric("Near-duplicate pairs", report["near_duplicate_pairs"])
-        rc3.metric("Mixed assay-type compounds", report["mixed_assay_compounds"])
-        rc4.metric("Unique scaffolds", report["unique_scaffolds"])
-        rc4.metric("Diversity ratio", report["diversity_ratio"])
+        st.markdown('<div class="bc-section-title">📊 Summary</div>', unsafe_allow_html=True)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Original rows", report["original_rows"])
+        m1.metric("Columns removed", report["columns_removed"])
+        m2.metric("Removed (missing/invalid)", report["rows_removed_missing_or_invalid"])
+        m2.metric("Exact duplicates removed", report["exact_duplicates_removed"])
+        m3.metric("Near-duplicates removed", report["near_duplicates_removed"])
+        if report.get("near_duplicate_method"):
+            method_label = "exact (brute-force)" if report["near_duplicate_method"] == "brute_force" else "fast (scaffold-bucketed)"
+            st.caption(f"Near-duplicate check used the **{method_label}** method "
+                       f"({'guaranteed complete' if report['near_duplicate_method'] == 'brute_force' else 'may miss a small number of cross-scaffold near-duplicates in exchange for speed on large datasets'}).")
+        m3.metric("Final clean rows", report["final_clean_rows"])
+        m4.metric("Data retained", f"{report['percent_retained']}%")
+        m4.metric("Mixtures flagged", report["mixtures_flagged"])
 
-        st.metric("Mean confidence score", report["mean_confidence_score"])
+        if report["columns_removed_names"]:
+            with st.expander(f"📎 {report['columns_removed']} columns removed (click to see which)"):
+                st.write(", ".join(report["columns_removed_names"]))
 
         st.divider()
 
-        st.markdown('<div class="bc-section-title">🚩 Flagged rows</div>', unsafe_allow_html=True)
-        tab1, tab2, tab3 = st.tabs(["🧬 Structure/unit issues", "🔁 Duplicates", "⚖️ Mixed assay types"])
+        st.markdown('<div class="bc-section-title">📥 Results</div>', unsafe_allow_html=True)
+        tab1, tab2, tab3 = st.tabs([
+            f"✅ Clean dataset ({len(clean_df)})",
+            f"🚫 Removed — missing/invalid ({len(removed_df)})",
+            f"🔁 Removed — duplicates ({len(duplicates_df)})",
+        ])
 
         with tab1:
-            issues_df = result_df[
-                (result_df["structure_status"] != "ok") | (result_df["unit_status"] != "ok")
-            ]
-            st.write(f"{len(issues_df)} rows flagged")
-            st.dataframe(issues_df, use_container_width=True)
+            st.caption("Ready for QSAR/ML training — standardized SMILES, consistent pActivity scale.")
+            st.dataframe(clean_df, use_container_width=True)
+            st.download_button(
+                "⬇️ Download cleaned dataset (CSV)",
+                data=clean_df.to_csv(index=False).encode("utf-8"),
+                file_name="cleaned_dataset.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
         with tab2:
-            dup_df = result_df[result_df["exact_duplicate"]]
-            st.write(f"{len(dup_df)} exact duplicate rows (by InChIKey)")
-            st.dataframe(dup_df, use_container_width=True)
-
-            if near_dup_pairs:
-                st.write(f"{len(near_dup_pairs)} near-duplicate pairs found "
-                         f"(checked first {report['near_duplicate_compounds_checked']} compounds)")
-                near_dup_df = pd.DataFrame(near_dup_pairs, columns=["row_i", "row_j", "similarity"])
-                st.dataframe(near_dup_df, use_container_width=True)
+            st.caption("Rows dropped because of missing or unparseable SMILES, or missing/invalid activity values.")
+            if removed_df.empty:
+                st.info("No rows were removed for missing/invalid data.")
+            else:
+                st.dataframe(removed_df, use_container_width=True)
+                st.download_button(
+                    "⬇️ Download removed (missing/invalid) rows (CSV)",
+                    data=removed_df.to_csv(index=False).encode("utf-8"),
+                    file_name="removed_missing_or_invalid.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 
         with tab3:
-            mixed_df = result_df[result_df["mixed_assay_flag"]]
-            st.write(f"{len(mixed_df)} rows belong to compounds tested under more than one assay type")
-            st.dataframe(mixed_df, use_container_width=True)
-
-        st.divider()
-
-        st.markdown('<div class="bc-section-title">🌈 Diversity overview</div>', unsafe_allow_html=True)
-        scaffold_counts = result_df["scaffold"].value_counts().head(15)
-        if not scaffold_counts.empty:
-            fig, ax = plt.subplots(figsize=(8, 4))
-            scaffold_counts.plot(kind="bar", ax=ax, color="#3d8bc4")
-            ax.set_ylabel("Compound count")
-            ax.set_title("Top 15 most common scaffolds")
-            plt.xticks(rotation=75, ha="right", fontsize=7)
-            st.pyplot(fig)
-
-        st.divider()
-
-        st.markdown('<div class="bc-section-title">⬇️ Download results</div>', unsafe_allow_html=True)
-        csv_bytes = result_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download cleaned dataset (CSV)",
-            data=csv_bytes,
-            file_name="curated_dataset.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+            st.caption("Duplicate compounds (exact, and optionally near-duplicate) — first occurrence was kept in the clean dataset.")
+            if duplicates_df.empty:
+                st.info("No duplicate compounds were found.")
+            else:
+                st.dataframe(duplicates_df, use_container_width=True)
+                st.download_button(
+                    "⬇️ Download removed duplicate rows (CSV)",
+                    data=duplicates_df.to_csv(index=False).encode("utf-8"),
+                    file_name="removed_duplicates.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 
 else:
-    st.info("👆 Upload a CSV file to get started. Expected columns: SMILES, activity value, "
-            "units (e.g. nM), and assay type (e.g. IC50/Ki).")
-
+    st.info("👆 Upload a CSV file to get started. BioCurate will auto-detect the "
+            "SMILES, activity value, units, and assay-type columns for you.")
